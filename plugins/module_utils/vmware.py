@@ -136,8 +136,11 @@ def find_object_by_name(content, name, obj_type, folder=None, recurse=True):
 
     objects = get_all_objs(content, obj_type, folder=folder, recurse=recurse)
     for obj in objects:
-        if unquote(obj.name) == name:
-            return obj
+        try:
+            if unquote(obj.name) == name:
+                return obj
+        except vmodl.fault.ManagedObjectNotFound:
+            pass
 
     return None
 
@@ -164,7 +167,7 @@ def get_parent_datacenter(obj):
     while True:
         if not hasattr(obj, 'parent'):
             break
-        obj = obj.parent
+        obj = obj.parent or obj.parentVApp
         if isinstance(obj, vim.Datacenter):
             datacenter = obj
             break
@@ -196,7 +199,7 @@ def find_resource_pool_by_cluster(content, resource_pool_name='Resources', clust
 
 
 def find_network_by_name(content, network_name, datacenter_name=None):
-    return find_object_by_name(content, quote_obj_name(network_name), [vim.Network], datacenter_name)
+    return find_object_by_name(content, network_name, [vim.Network], datacenter_name)
 
 
 def find_vm_by_id(content, vm_id, vm_id_type="vm_name", datacenter=None,
@@ -306,7 +309,8 @@ def gather_vm_facts(content, vm):
         'instance_uuid': vm.config.instanceUuid,
         'guest_tools_status': _get_vm_prop(vm, ('guest', 'toolsRunningStatus')),
         'guest_tools_version': _get_vm_prop(vm, ('guest', 'toolsVersion')),
-        'guest_question': vm.summary.runtime.question,
+        'guest_question': json.loads(json.dumps(vm.summary.runtime.question, cls=VmomiSupport.VmomiJSONEncoder,
+                                                sort_keys=True, strip_dynamic=True)),
         'guest_consolidation_needed': vm.summary.runtime.consolidationNeeded,
         'ipv4': None,
         'ipv6': None,
@@ -317,6 +321,7 @@ def gather_vm_facts(content, vm):
         'vnc': {},
         'moid': vm._moId,
         'vimref': "vim.VirtualMachine:%s" % vm._moId,
+        'advanced_settings': {},
     }
 
     # facts that may or may not exist
@@ -371,6 +376,10 @@ def gather_vm_facts(content, vm):
                     break
 
         facts['customvalues'][kn] = value_obj.value
+
+    # Resolve advanced settings
+    for advanced_setting in vm.config.extraConfig:
+        facts['advanced_settings'][advanced_setting.key] = advanced_setting.value
 
     net_dict = {}
     vmnet = _get_vm_prop(vm, ('guest', 'net'))
@@ -643,7 +652,10 @@ def get_all_objs(content, vimtype, folder=None, recurse=True):
     obj = {}
     container = content.viewManager.CreateContainerView(folder, vimtype, recurse)
     for managed_object_ref in container.view:
-        obj.update({managed_object_ref: managed_object_ref.name})
+        try:
+            obj.update({managed_object_ref: managed_object_ref.name})
+        except vmodl.fault.ManagedObjectNotFound:
+            pass
     return obj
 
 
@@ -932,6 +944,13 @@ def quote_obj_name(object_name=None):
             object_name = object_name.replace(key, SPECIAL_CHARS[key])
 
     return object_name
+
+
+def dvs_supports_mac_learning(dvs):
+    """
+    Test if the switch supports MAC learning
+    """
+    return hasattr(dvs.capability.featuresSupported, 'macLearningSupported') and dvs.capability.featuresSupported.macLearningSupported
 
 
 class PyVmomi(object):
@@ -1478,7 +1497,7 @@ class PyVmomi(object):
         return None
 
     # Resource pool
-    def find_resource_pool_by_name(self, resource_pool_name, folder=None):
+    def find_resource_pool_by_name(self, resource_pool_name='Resources', folder=None):
         """
         Get resource pool managed object by name
         Args:

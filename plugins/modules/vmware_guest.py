@@ -74,7 +74,7 @@ options:
     description:
     - If multiple virtual machines matching the name, use the first or last found.
     default: 'first'
-    choices: [ first, last ]
+    choices: [ 'first', 'last' ]
     type: str
   uuid:
     description:
@@ -101,6 +101,10 @@ options:
     description:
     - Flag the instance as a template.
     - This will mark the given virtual machine as template.
+    - Note, this may need to be done in a dedicated task invocation that is not making
+      any other changes. For example, user cannot change the state from powered-on to
+      powered-off AND save as template in the same task.
+    - See M(community.vmware.vmware_guest) source for more details.
     default: false
     type: bool
   folder:
@@ -153,6 +157,10 @@ options:
             - Valid values are C(buslogic), C(lsilogic), C(lsilogicsas) and C(paravirtual).
             - C(paravirtual) is default.
             choices: [ 'buslogic', 'lsilogic', 'lsilogicsas', 'paravirtual' ]
+        secure_boot:
+            type: bool
+            description: Whether to enable or disable (U)EFI secure boot.
+            version_added: '1.11.0'
         memory_reservation_lock:
             type: bool
             description:
@@ -200,8 +208,13 @@ options:
             description:
             - Enable Virtualization Based Security feature for Windows on ESXi 6.7 and later, from hardware version 14.
             - Supported Guest OS are Windows 10 64 bit, Windows Server 2016, Windows Server 2019 and later.
-            - The firmware of virtual machine must be EFI.
+            - The firmware of virtual machine must be EFI and secure boot must be enabled.
+            - Virtualization Based Security depends on nested virtualization and Intel Virtualization Technology for Directed I/O.
             - Deploy on unsupported ESXi, hardware version or firmware may lead to failure or deployed VM with unexpected configurations.
+        iommu:
+            type: bool
+            description: Flag to specify if I/O MMU is enabled for this virtual machine.
+            version_added: '1.11.0'
   guest_id:
     type: str
     description:
@@ -229,7 +242,7 @@ options:
             description:
             - Disk storage size.
             - Please specify storage unit like [kb, mb, gb, tb].
-            type: int
+            type: str
         size_kb:
             description: Disk storage size in kb.
             type: int
@@ -247,8 +260,9 @@ options:
             - Type of disk.
             - If C(thin) specified, disk type is set to thin disk.
             - If C(eagerzeroedthick) specified, disk type is set to eagerzeroedthick disk. Added Ansible 2.5.
-            - If not specified, disk type is thick disk, no eagerzero.
+            - If not specified, disk type is inherited from the source VM or template when cloned and thick disk, no eagerzero otherwise.
             type: str
+            choices: [ 'thin', 'thick', 'eagerzeroedthick' ]
         datastore:
             type: str
             description:
@@ -267,6 +281,7 @@ options:
             - C(disk.datastore) and C(disk.autoselect_datastore) will not be used if C(datastore) is specified outside this C(disk) configuration.
         disk_mode:
             type: str
+            choices: ['persistent', 'independent_persistent', 'independent_nonpersistent']
             description:
             - Type of disk mode.
             - Added in Ansible 2.6.
@@ -276,19 +291,19 @@ options:
               but not affected by snapshots.
         controller_type:
             type: str
+            choices: ['buslogic', 'lsilogic', 'lsilogicsas', 'paravirtual', 'sata', 'nvme']
             description:
             - Type of disk controller.
-            - Valid values are C(buslogic), C(lsilogic), C(lsilogicsas), C(paravirtual), C(sata) and C(nvme).
             - C(nvme) controller type support starts on ESXi 6.5 with VM hardware version C(version) 13.
               Set this type on not supported ESXi or VM hardware version will lead to failure in deployment.
             - When set to C(sata), please make sure C(unit_number) is correct and not used by SATA CDROMs.
             - If set to C(sata) type, please make sure C(controller_number) and C(unit_number) are set correctly when C(cdrom) also set to C(sata) type.
         controller_number:
             type: int
+            choices: [0, 1, 2, 3]
             description:
             - Disk controller bus number.
             - The maximum number of same type controller is 4 per VM.
-            - Valid value range from 0 to 3.
         unit_number:
             type: int
             description:
@@ -428,6 +443,14 @@ options:
     - C(esxi_hostname) and C(cluster) are mutually exclusive parameters.
     - This parameter is case sensitive.
     type: str
+  advanced_settings:
+    description:
+    - Define a list of advanced settings to be added to the VMX config.
+    - An advanced settings object takes two fields C(key) and C(value).
+    - Incorrect key and values will be ignored.
+    elements: dict
+    type: list
+    version_added: '1.7.0'
   annotation:
     description:
     - A note or annotation to include in the virtual machine.
@@ -684,7 +707,7 @@ options:
   convert:
     description:
     - Specify convert disk type while cloning template or virtual machine.
-    choices: [ thin, thick, eagerzeroedthick ]
+    choices: [ 'thin', 'thick', 'eagerzeroedthick' ]
     type: str
 extends_documentation_fragment:
 - community.vmware.vmware.documentation
@@ -1741,7 +1764,6 @@ class PyVmomiHelper(PyVmomi):
 
         temp_version = self.params['hardware']['version']
         if temp_version is not None:
-            hw_version_check_failed = False
             if temp_version.lower() == 'latest':
                 # Check is to make sure vm_obj is not of type template
                 if vm_obj and not vm_obj.config.template:
@@ -1757,14 +1779,10 @@ class PyVmomiHelper(PyVmomi):
                 try:
                     temp_version = int(temp_version)
                 except ValueError:
-                    hw_version_check_failed = True
-
-                if temp_version not in range(3, 18):
-                    hw_version_check_failed = True
-
-                if hw_version_check_failed:
                     self.module.fail_json(msg="Failed to set hardware.version '%s' value as valid"
-                                          " values range from 3 (ESX 2.x) to 17 (ESXi 7.0)." % temp_version)
+                                          " values are either 'latest' or a number."
+                                          " Please check VMware documentation for valid VM hardware versions." % temp_version)
+
                 # Hardware version is denoted as "vmx-10"
                 version = "vmx-%02d" % temp_version
                 self.configspec.version = version
@@ -1792,16 +1810,27 @@ class PyVmomiHelper(PyVmomi):
                         # Don't fail if VM is already upgraded.
                         pass
 
+        secure_boot = self.params['hardware']['secure_boot']
+        if secure_boot is not None:
+            self.configspec.bootOptions = vim.vm.BootOptions()
+            self.configspec.bootOptions.efiSecureBootEnabled = True
+            if vm_obj is None or self.configspec.bootOptions.efiSecureBootEnabled != vm_obj.config.bootOptions.efiSecureBootEnabled:
+                self.change_detected = True
+
+        iommu = self.params['hardware']['iommu']
+        if iommu is not None:
+            if self.configspec.flags is None:
+                self.configspec.flags = vim.vm.FlagInfo()
+            self.configspec.flags.vvtdEnabled = iommu
+            if vm_obj is None or self.configspec.flags.vvtdEnabled != vm_obj.config.flags.vvtdEnabled:
+                self.change_detected = True
+
         virt_based_security = self.params['hardware']['virt_based_security']
         if virt_based_security is not None:
-            if vm_obj is None or vm_obj.config.flags.vbsEnabled != virt_based_security:
+            if self.configspec.flags is None:
                 self.configspec.flags = vim.vm.FlagInfo()
-                self.configspec.flags.vbsEnabled = virt_based_security
-                if virt_based_security:
-                    self.configspec.flags.vvtdEnabled = True
-                    self.configspec.nestedHVEnabled = True
-                    self.configspec.bootOptions = vim.vm.BootOptions()
-                    self.configspec.bootOptions.efiSecureBootEnabled = True
+            self.configspec.flags.vbsEnabled = virt_based_security
+            if vm_obj is None or vm_obj.config.flags.vbsEnabled != self.configspec.flags.vbsEnabled:
                 self.change_detected = True
 
     def get_device_by_type(self, vm=None, type=None):
@@ -2169,8 +2198,8 @@ class PyVmomiHelper(PyVmomi):
             self.configspec.vAppConfig = new_vmconfig_spec
             self.change_detected = True
 
-    def customize_customvalues(self, vm_obj, config_spec):
-        if not self.params['customvalues']:
+    def customize_advanced_settings(self, vm_obj, config_spec):
+        if not self.params['advanced_settings']:
             return
 
         vm_custom_spec = config_spec
@@ -2178,20 +2207,55 @@ class PyVmomiHelper(PyVmomi):
 
         changed = False
         facts = self.gather_facts(vm_obj)
-        for kv in self.params['customvalues']:
+        for kv in self.params['advanced_settings']:
             if 'key' not in kv or 'value' not in kv:
-                self.module.exit_json(msg="customvalues items required both 'key' and 'value' fields.")
+                self.module.exit_json(msg="advanced_settings items required both 'key' and 'value' fields.")
 
             # If kv is not kv fetched from facts, change it
-            if kv['key'] not in facts['customvalues'] or facts['customvalues'][kv['key']] != kv['value']:
+            if isinstance(kv['value'], (bool, int)):
+                specifiedvalue = str(kv['value']).upper()
+                comparisonvalue = facts['advanced_settings'].get(kv['key'], '').upper()
+            else:
+                specifiedvalue = kv['value']
+                comparisonvalue = facts['advanced_settings'].get(kv['key'], '')
+
+            if (kv['key'] not in facts['advanced_settings'] and kv['value'] != '') or comparisonvalue != specifiedvalue:
                 option = vim.option.OptionValue()
                 option.key = kv['key']
-                option.value = kv['value']
+                option.value = specifiedvalue
 
                 vm_custom_spec.extraConfig.append(option)
                 changed = True
 
             if changed:
+                self.change_detected = True
+
+    def customize_customvalues(self, vm_obj):
+        if not self.params['customvalues']:
+            return
+
+        if not self.is_vcenter():
+            self.module.warn("Currently connected to ESXi. "
+                             "customvalues are a vCenter feature, this parameter will be ignored.")
+            return
+
+        facts = self.gather_facts(vm_obj)
+        for kv in self.params['customvalues']:
+            if 'key' not in kv or 'value' not in kv:
+                self.module.exit_json(msg="customvalues items required both 'key' and 'value' fields.")
+
+            key_id = None
+            for field in self.content.customFieldsManager.field:
+                if field.name == kv['key']:
+                    key_id = field.key
+                    break
+
+            if not key_id:
+                self.module.fail_json(msg="Unable to find custom value key %s" % kv['key'])
+
+            # If kv is not kv fetched from facts, change it
+            if kv['key'] not in facts['customvalues'] or facts['customvalues'][kv['key']] != kv['value']:
+                self.content.customFieldsManager.SetField(entity=vm_obj, key=key_id, value=kv['value'])
                 self.change_detected = True
 
     def customize_vm(self, vm_obj):
@@ -2374,9 +2438,9 @@ class PyVmomiHelper(PyVmomi):
 
     def get_configured_disk_size(self, expected_disk_spec):
         # what size is it?
-        if [x for x in expected_disk_spec.keys() if x.startswith('size_') or x == 'size']:
+        if [x for x in expected_disk_spec.keys() if (x.startswith('size_') or x == 'size') and expected_disk_spec[x]]:
             # size, size_tb, size_gb, size_mb, size_kb
-            if 'size' in expected_disk_spec:
+            if expected_disk_spec['size']:
                 size_regex = re.compile(r'(\d+(?:\.\d+)?)([tgmkTGMK][bB])')
                 disk_size_m = size_regex.match(expected_disk_spec['size'])
                 try:
@@ -2401,10 +2465,9 @@ class PyVmomiHelper(PyVmomi):
                     self.module.fail_json(msg="Failed to parse disk size please review value"
                                               " provided using documentation.")
             else:
-                param = [x for x in expected_disk_spec.keys() if x.startswith('size_')][0]
-                unit = param.split('_')[-1].lower()
-                expected = [x[1] for x in expected_disk_spec.items() if x[0].startswith('size_')][0]
-                expected = int(expected)
+                param = [x for x in expected_disk_spec.keys() if x.startswith('size_') and expected_disk_spec[x]][0]
+                unit = param.split('_')[-1]
+                expected = expected_disk_spec[param]
 
             disk_units = dict(tb=3, gb=2, mb=1, kb=0)
             if unit in disk_units:
@@ -2417,7 +2480,7 @@ class PyVmomiHelper(PyVmomi):
 
         # No size found but disk, fail
         self.module.fail_json(
-            msg="No size, size_kb, size_mb, size_gb or size_tb attribute found into disk configuration")
+            msg="No size, size_kb, size_mb, size_gb or size_tb defined in disk configuration")
 
     def add_existing_vmdk(self, vm_obj, expected_disk_spec, diskspec, scsi_ctl):
         """
@@ -2443,22 +2506,15 @@ class PyVmomiHelper(PyVmomi):
         """
         controllers = []
         for disk_spec in self.params.get('disk'):
-            if 'controller_type' not in disk_spec or 'controller_number' not in disk_spec or 'unit_number' not in disk_spec:
+            if disk_spec['controller_type'] is None or disk_spec['controller_number'] is None or disk_spec['unit_number'] is None:
                 self.module.fail_json(msg="'disk.controller_type', 'disk.controller_number' and 'disk.unit_number' are"
                                           " mandatory parameters when configure multiple disk controllers and disks.")
-            try:
-                ctl_num = int(disk_spec['controller_number'])
-                ctl_unit_num = int(disk_spec['unit_number'])
-            except ValueError:
-                self.module.fail_json(msg="'disk.controller_number' and 'disk.unit_number' attributes should be integer"
-                                          " values.")
+
+            ctl_num = disk_spec['controller_number']
+            ctl_unit_num = disk_spec['unit_number']
+
             disk_spec['unit_number'] = ctl_unit_num
-            ctl_type = disk_spec['controller_type'].lower()
-            # max number of same type disk controller is 4
-            if ctl_num > 3:
-                self.module.fail_json(msg="'disk.controller_number' value is invalid, valid value is from 0 to 3.")
-            if ctl_type not in ['buslogic', 'paravirtual', 'lsilogic', 'lsilogicsas', 'sata', 'nvme']:
-                self.module.fail_json(msg="Disk controller type: '%s' is not supported or invalid." % disk_spec['controller_type'])
+            ctl_type = disk_spec['controller_type']
 
             if len(controllers) != 0:
                 ctl_exist = False
@@ -2485,12 +2541,8 @@ class PyVmomiHelper(PyVmomi):
 
     def set_disk_parameters(self, disk_spec, expected_disk_spec, reconfigure=False):
         disk_modified = False
-        if 'disk_mode' in expected_disk_spec:
-            disk_mode = expected_disk_spec.get('disk_mode', 'persistent').lower()
-            valid_disk_mode = ['persistent', 'independent_persistent', 'independent_nonpersistent']
-            if disk_mode not in valid_disk_mode:
-                self.module.fail_json(msg="disk_mode specified is not valid."
-                                          " Should be one of ['%s']" % "', '".join(valid_disk_mode))
+        if expected_disk_spec['disk_mode']:
+            disk_mode = expected_disk_spec.get('disk_mode')
             if reconfigure:
                 if disk_spec.device.backing.diskMode != disk_mode:
                     disk_spec.device.backing.diskMode = disk_mode
@@ -2498,11 +2550,11 @@ class PyVmomiHelper(PyVmomi):
             else:
                 disk_spec.device.backing.diskMode = disk_mode
         # default is persistent for new deployed VM
-        elif 'disk_mode' not in expected_disk_spec and not reconfigure:
+        elif not reconfigure:
             disk_spec.device.backing.diskMode = "persistent"
 
         if not reconfigure:
-            disk_type = expected_disk_spec.get('type', 'thin').lower()
+            disk_type = expected_disk_spec.get('type', 'thin')
             if disk_type == 'thin':
                 disk_spec.device.backing.thinProvisioned = True
             elif disk_type == 'eagerzeroedthick':
@@ -2583,7 +2635,7 @@ class PyVmomiHelper(PyVmomi):
         # do not support mixed old scsi disks configuration and new multiple controller types of disks configuration
         configure_multiple_ctl = False
         for disk_spec in self.params.get('disk'):
-            if 'controller_type' in disk_spec or 'controller_number' in disk_spec or 'unit_number' in disk_spec:
+            if disk_spec['controller_type'] or disk_spec['controller_number'] or disk_spec['unit_number']:
                 configure_multiple_ctl = True
                 break
         if configure_multiple_ctl:
@@ -2627,12 +2679,8 @@ class PyVmomiHelper(PyVmomi):
             if disk_index == 7:
                 disk_index += 1
 
-            if 'disk_mode' in expected_disk_spec:
-                disk_mode = expected_disk_spec.get('disk_mode', 'persistent').lower()
-                valid_disk_mode = ['persistent', 'independent_persistent', 'independent_nonpersistent']
-                if disk_mode not in valid_disk_mode:
-                    self.module.fail_json(msg="disk_mode specified is not valid."
-                                              " Should be one of ['%s']" % "', '".join(valid_disk_mode))
+            if expected_disk_spec['disk_mode']:
+                disk_mode = expected_disk_spec.get('disk_mode', 'persistent')
 
                 if (vm_obj and diskspec.device.backing.diskMode != disk_mode) or (vm_obj is None):
                     diskspec.device.backing.diskMode = disk_mode
@@ -2641,14 +2689,14 @@ class PyVmomiHelper(PyVmomi):
                 diskspec.device.backing.diskMode = "persistent"
 
             # is it thin?
-            if 'type' in expected_disk_spec:
+            if expected_disk_spec['type']:
                 disk_type = expected_disk_spec.get('type', '').lower()
                 if disk_type == 'thin':
                     diskspec.device.backing.thinProvisioned = True
                 elif disk_type == 'eagerzeroedthick':
                     diskspec.device.backing.eagerlyScrub = True
 
-            if 'filename' in expected_disk_spec and expected_disk_spec['filename'] is not None:
+            if expected_disk_spec['filename']:
                 self.add_existing_vmdk(vm_obj, expected_disk_spec, diskspec, scsi_ctl)
                 continue
             if vm_obj is None or self.params['template']:
@@ -2709,7 +2757,7 @@ class PyVmomiHelper(PyVmomi):
 
         if self.params['disk']:
             # TODO: really use the datastore for newly created disks
-            if 'autoselect_datastore' in self.params['disk'][0] and self.params['disk'][0]['autoselect_datastore']:
+            if self.params['disk'][0]['autoselect_datastore']:
                 datastores = []
 
                 if self.params['cluster']:
@@ -2736,16 +2784,14 @@ class PyVmomiHelper(PyVmomi):
 
                     if (ds.summary.freeSpace > datastore_freespace) or (ds.summary.freeSpace == datastore_freespace and not datastore):
                         # If datastore field is provided, filter destination datastores
-                        if 'datastore' in self.params['disk'][0] and \
-                                isinstance(self.params['disk'][0]['datastore'], str) and \
-                                ds.name.find(self.params['disk'][0]['datastore']) < 0:
+                        if self.params['disk'][0]['datastore'] and ds.name.find(self.params['disk'][0]['datastore']) < 0:
                             continue
 
                         datastore = ds
                         datastore_name = datastore.name
                         datastore_freespace = ds.summary.freeSpace
 
-            elif 'datastore' in self.params['disk'][0]:
+            elif self.params['disk'][0]['datastore']:
                 datastore_name = self.params['disk'][0]['datastore']
                 # Check if user has provided datastore cluster first
                 datastore_cluster = self.cache.find_obj(self.content, [vim.StoragePod], datastore_name)
@@ -2997,11 +3043,11 @@ class PyVmomiHelper(PyVmomi):
                         if isinstance(device, vim.vm.device.VirtualDisk):
                             disk_locator = vim.vm.RelocateSpec.DiskLocator()
                             disk_locator.diskBackingInfo = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
-                            if self.params['convert'] in ['thin']:
+                            if self.params['convert'] == 'thin':
                                 disk_locator.diskBackingInfo.thinProvisioned = True
-                            if self.params['convert'] in ['eagerzeroedthick']:
+                            if self.params['convert'] == 'eagerzeroedthick':
                                 disk_locator.diskBackingInfo.eagerlyScrub = True
-                            if self.params['convert'] in ['thick']:
+                            if self.params['convert'] == 'thick':
                                 disk_locator.diskBackingInfo.diskMode = "persistent"
                             disk_locator.diskId = device.key
                             disk_locator.datastore = datastore
@@ -3098,9 +3144,9 @@ class PyVmomiHelper(PyVmomi):
                 if task.info.state == 'error':
                     return {'changed': self.change_applied, 'failed': True, 'msg': task.info.error.msg, 'op': 'annotation'}
 
-            if self.params['customvalues']:
+            if self.params['advanced_settings']:
                 vm_custom_spec = vim.vm.ConfigSpec()
-                self.customize_customvalues(vm_obj=vm, config_spec=vm_custom_spec)
+                self.customize_advanced_settings(vm_obj=vm, config_spec=vm_custom_spec)
                 task = vm.ReconfigVM_Task(vm_custom_spec)
                 self.wait_for_task(task)
                 if task.info.state == 'error':
@@ -3142,7 +3188,8 @@ class PyVmomiHelper(PyVmomi):
         self.configure_disks(vm_obj=self.current_vm_obj)
         self.configure_network(vm_obj=self.current_vm_obj)
         self.configure_cdrom(vm_obj=self.current_vm_obj)
-        self.customize_customvalues(vm_obj=self.current_vm_obj, config_spec=self.configspec)
+        self.customize_advanced_settings(vm_obj=self.current_vm_obj, config_spec=self.configspec)
+        self.customize_customvalues(vm_obj=self.current_vm_obj)
         self.configure_resource_alloc_info(vm_obj=self.current_vm_obj)
         self.configure_vapp_properties(vm_obj=self.current_vm_obj)
 
@@ -3342,13 +3389,33 @@ def main():
         is_template=dict(type='bool', default=False),
         annotation=dict(type='str', aliases=['notes']),
         customvalues=dict(type='list', default=[], elements='dict'),
+        advanced_settings=dict(type='list', default=[], elements='dict'),
         name=dict(type='str'),
         name_match=dict(type='str', choices=['first', 'last'], default='first'),
         uuid=dict(type='str'),
         use_instance_uuid=dict(type='bool', default=False),
         folder=dict(type='str'),
         guest_id=dict(type='str'),
-        disk=dict(type='list', default=[], elements='dict'),
+        disk=dict(
+            type='list',
+            default=[],
+            elements='dict',
+            options=dict(
+                autoselect_datastore=dict(type='bool'),
+                controller_number=dict(type='int', choices=[0, 1, 2, 3]),
+                controller_type=dict(type='str', choices=['buslogic', 'lsilogic', 'paravirtual', 'lsilogicsas', 'sata', 'nvme']),
+                datastore=dict(type='str'),
+                disk_mode=dict(type='str', choices=['persistent', 'independent_persistent', 'independent_nonpersistent']),
+                filename=dict(type='str'),
+                size=dict(type='str'),
+                size_gb=dict(type='int'),
+                size_kb=dict(type='int'),
+                size_mb=dict(type='int'),
+                size_tb=dict(type='int'),
+                type=dict(type='str', choices=['thin', 'eagerzeroedthick', 'thick']),
+                unit_number=dict(type='int'),
+            )
+        ),
         cdrom=dict(type='raw', default=[]),
         hardware=dict(
             type='dict',
@@ -3369,8 +3436,10 @@ def main():
                 num_cpu_cores_per_socket=dict(type='int'),
                 num_cpus=dict(type='int'),
                 scsi=dict(type='str', choices=['buslogic', 'lsilogic', 'lsilogicsas', 'paravirtual']),
+                secure_boot=dict(type='bool'),
                 version=dict(type='str'),
-                virt_based_security=dict(type='bool')
+                virt_based_security=dict(type='bool'),
+                iommu=dict(type='bool')
             )),
         force=dict(type='bool', default=False),
         datacenter=dict(type='str', default='ha-datacenter'),
@@ -3428,6 +3497,23 @@ def main():
     result = {'failed': False, 'changed': False}
 
     pyv = PyVmomiHelper(module)
+
+    # Check requirements for virtualization based security
+    if pyv.params['hardware']['virt_based_security']:
+        if not pyv.params['hardware']['nested_virt']:
+            pyv.module.warn("Virtualization based security requires nested virtualization. At the moment, this modules enables this implicitly. "
+                            "Please consider enabling this explicitly because this behavior might change in the future.")
+            pyv.params['hardware']['nested_virt'] = True
+
+        if not pyv.params['hardware']['secure_boot']:
+            pyv.module.warn("Virtualization based security requires (U)EFI secure boot. At the moment, this modules enables this implicitly. "
+                            "Please consider enabling this explicitly because this behavior might change in the future.")
+            pyv.params['hardware']['secure_boot'] = True
+
+        if not pyv.params['hardware']['iommu']:
+            pyv.module.warn("Virtualization based security requires I/O MMU. At the moment, this modules enables this implicitly. "
+                            "Please consider enabling iommu explicitly because this behavior might change in the future.")
+            pyv.params['hardware']['iommu'] = True
 
     # Check if the VM exists before continuing
     vm = pyv.get_vm()

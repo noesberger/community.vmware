@@ -96,8 +96,9 @@ DOCUMENTATION = r'''
         with_nested_properties:
             description:
             - This option transform flatten properties name to nested dictionary.
+            - From 1.10.0 and onwards, default value is set to C(True).
             type: bool
-            default: False
+            default: True
         keyed_groups:
             description:
             - Add hosts to group based on the values of a variable.
@@ -167,7 +168,6 @@ EXAMPLES = r'''
     username: administrator@vsphere.local
     password: Esxi@123$%
     validate_certs: False
-    with_tags: False
     properties:
     - 'name'
     - 'config.name'
@@ -238,7 +238,6 @@ EXAMPLES = r'''
     username: administrator@vsphere.local
     password: Esxi@123$%
     validate_certs: False
-    with_tags: False
     properties:
     - 'name'
     - 'config.name'
@@ -297,6 +296,24 @@ EXAMPLES = r'''
     with_nested_properties: True
     filters:
     - "tag_category.OS is defined and 'Linux' in tag_category.OS"
+
+# customizing hostnames based on VM's FQDN. The second hostnames template acts as a fallback mechanism.
+    plugin: community.vmware.vmware_vm_inventory
+    strict: False
+    hostname: 10.65.223.31
+    username: administrator@vsphere.local
+    password: Esxi@123$%
+    validate_certs: False
+    hostnames:
+     - 'config.name+"."+guest.ipStack.0.dnsConfig.domainName'
+     - 'config.name'
+    properties:
+      - 'config.name'
+      - 'config.guestId'
+      - 'guest.hostName'
+      - 'guest.ipAddress'
+      - 'guest.guestFamily'
+      - 'guest.ipStack'
 '''
 
 import ssl
@@ -788,7 +805,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             for vm_obj_property in vm_obj.propSet:
                 properties[vm_obj_property.name] = vm_obj_property.val
 
-            if (properties.get('runtime.connectionState') or properties['runtime'].connectionState) in ('orphaned', 'inaccessible'):
+            if (properties.get('runtime.connectionState') or properties['runtime'].connectionState) in ('orphaned', 'inaccessible', 'disconnected'):
                 continue
 
             # Custom values
@@ -809,6 +826,9 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
                 properties['categories'] = []
                 properties['tag_category'] = {}
                 for tag_id in tag_association.list_attached_tags(vm_dynamic_id):
+                    if tag_id not in tags_info:
+                        # Ghost Tags - community.vmware#681
+                        continue
                     # Add tags related to VM
                     properties['tags'].append(tags_info[tag_id][0])
                     # Add categories related to VM
